@@ -463,36 +463,31 @@ class DSMoE(nn.Module):
     def forward(self, x):
         b, t, c = x.shape
         x_flat = x.reshape(b * t, c)
-
+    
         gate_val_continuous = self.gate(x_flat)
-
-        # Apply expert bias *before* topk
         biased_gate_vals = gate_val_continuous + self.expert_bias
-
-        # get top-(num_exp-1) experts excluding the first one
+    
+        # Get top-(num_exp-1) experts excluding the first one
         gate_vals, gate_val_indices = torch.topk(biased_gate_vals, self.num_exp - 1, dim=-1)
         gate_vals = gate_vals / gate_vals.sum(dim=-1, keepdim=True)  # normalize
-
-        # prepend the shared expert (index 0) - Corrected handling
+    
+        # Prepend shared expert (index 0)
         shared_expert_weight = torch.ones_like(gate_vals[:, :1]) / self.num_exp
         gate_vals = torch.cat([shared_expert_weight, gate_vals * (self.num_exp - 1) / self.num_exp], dim=-1)
         gate_val_indices = torch.cat([torch.zeros_like(gate_val_indices[:, :1]), gate_val_indices + 1], dim=-1)
-
-        # process all experts once (fully static)
-        expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=0)  # [num_experts, b*t, c]
-
-        # create routing weights matrix (one-hot * gate values)
+    
+        output = torch.zeros_like(x_flat)
         router_weights = torch.zeros(x_flat.size(0), self.num_experts, device=x.device)
+    
         for i in range(self.num_exp):
-            idx = gate_val_indices[:, i:i+1]  # [b*t, 1]
-            val = gate_vals[:, i:i+1]  # [b*t, 1]
-            router_weights.scatter_add_(1, idx, val)
-
-        # apply routing weights to expert outputs
-        weighted_outputs = expert_outputs * router_weights.transpose(0, 1).unsqueeze(-1)  # [num_experts, b*t, c]
-        output = weighted_outputs.sum(dim=0)  # [b*t, c]
-
-        # Return both the output and the router_weights
+            selected_expert = gate_val_indices[:, i]  # Selected expert indices
+            mask = torch.arange(self.num_experts, device=x.device).unsqueeze(0) == selected_expert.unsqueeze(1)
+            expert_inputs = x_flat.unsqueeze(1) * mask.unsqueeze(-1)  # Mask input for each expert
+            expert_outputs = torch.stack([expert(expert_inputs[:, j]) for j, expert in enumerate(self.experts)], dim=1)
+            weighted_expert_out = (expert_outputs * gate_vals[:, i:i+1].unsqueeze(-1)).sum(dim=1)
+            output += weighted_expert_out
+            router_weights.scatter_add_(1, selected_expert.unsqueeze(1), gate_vals[:, i:i+1])
+    
         return output.reshape(b, t, c), router_weights
 
 class Block(nn.Module):
